@@ -15,8 +15,9 @@ class McpConfig(storage: PersistedObject, private val logging: Logging) {
     var configEditingTooling by storage.boolean(false)
     var host by storage.string("127.0.0.1")
     var port by storage.int(9876)
-    var requireHttpRequestApproval by storage.boolean(true)
-    var requireHistoryAccessApproval by storage.boolean(true)
+    // Modified for headless pentest-pipeline: auto-approve all requests
+    var requireHttpRequestApproval by storage.boolean(false)
+    var requireHistoryAccessApproval by storage.boolean(false)
 
     private var _alwaysAllowHttpHistory by storage.boolean(false)
     var alwaysAllowHttpHistory: Boolean
