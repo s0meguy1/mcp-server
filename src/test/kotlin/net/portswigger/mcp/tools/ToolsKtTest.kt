@@ -14,6 +14,10 @@ import burp.api.montoya.logging.Logging
 import burp.api.montoya.persistence.PersistedObject
 import burp.api.montoya.proxy.Proxy
 import burp.api.montoya.proxy.ProxyHttpRequestResponse
+import burp.api.montoya.scanner.Crawl
+import burp.api.montoya.scanner.Scanner
+import burp.api.montoya.scanner.audit.Audit
+import burp.api.montoya.sitemap.SiteMap
 import burp.api.montoya.utilities.Base64Utils
 import burp.api.montoya.utilities.RandomUtils
 import burp.api.montoya.utilities.URLUtils
@@ -155,6 +159,35 @@ class ToolsKtTest {
     fun tearDown() {
         runBlocking { if (client.isConnected()) client.close() }
         serverManager.stop {}
+    }
+
+    private fun restartWithProfessionalEdition() {
+        val burpSuite = mockk<burp.api.montoya.burpsuite.BurpSuite>()
+        val version = mockk<burp.api.montoya.core.Version>()
+        every { api.burpSuite() } returns burpSuite
+        every { burpSuite.version() } returns version
+        every { version.edition() } returns BurpSuiteEdition.PROFESSIONAL
+        every { burpSuite.taskExecutionEngine() } returns mockk(relaxed = true)
+        every { burpSuite.exportProjectOptionsAsJson() } returns "{}"
+        every { burpSuite.exportUserOptionsAsJson() } returns "{}"
+        every { burpSuite.importProjectOptionsFromJson(any()) } just runs
+        every { burpSuite.importUserOptionsFromJson(any()) } just runs
+
+        serverManager.stop {}
+        serverStarted = false
+        serverManager.start(config) { state ->
+            if (state is ServerState.Running) serverStarted = true
+        }
+
+        runBlocking {
+            var attempts = 0
+            while (!serverStarted && attempts < 30) {
+                delay(100)
+                attempts++
+            }
+            if (!serverStarted) throw IllegalStateException("Server failed to start after timeout")
+            client.connectToServer("http://127.0.0.1:${testPort}")
+        }
     }
 
     @Nested
@@ -755,6 +788,117 @@ class ToolsKtTest {
                 
                 delay(100)
                 assertEquals("Reached end of items", result3.expectTextContent())
+            }
+        }
+    }
+
+    @Nested
+    inner class ScannerOrchestrationToolsTests {
+        @Test
+        fun `start burp crawl should return tracked task status`() {
+            val scanner = mockk<Scanner>()
+            val crawl = mockk<Crawl>()
+            every { api.scanner() } returns scanner
+            every { scanner.startCrawl(any()) } returns crawl
+            every { crawl.requestCount() } returns 3
+            every { crawl.errorCount() } returns 0
+            every { crawl.statusMessage() } returns "Crawling"
+            every { crawl.delete() } just runs
+            restartWithProfessionalEdition()
+
+            runBlocking {
+                val result = client.callTool(
+                    "start_burp_crawl", mapOf(
+                        "seedUrls" to listOf("https://example.com/"),
+                        "taskName" to "test-crawl"
+                    )
+                )
+                delay(100)
+                val text = result.expectTextContent()
+                assertTrue(text.contains("\"taskType\":\"crawl\""), text)
+                assertTrue(text.contains("\"statusMessage\":\"Crawling\""), text)
+
+                val status = client.callTool("get_burp_scan_task_status", emptyMap())
+                delay(100)
+                val statusText = status.expectTextContent()
+                assertTrue(statusText.contains("\"taskName\":\"test-crawl\""), statusText)
+            }
+
+            verify(exactly = 1) { scanner.startCrawl(any()) }
+        }
+
+        @Test
+        fun `start burp audit should add supplied requests and expose issues count`() {
+            val scanner = mockk<Scanner>()
+            val audit = mockk<Audit>()
+            every { api.scanner() } returns scanner
+            every { scanner.startAudit(any()) } returns audit
+            every { HttpRequest.httpRequest(any(), any<String>()) } returns mockk<HttpRequest>()
+            every { audit.addRequest(any()) } just runs
+            every { audit.requestCount() } returns 1
+            every { audit.errorCount() } returns 0
+            every { audit.statusMessage() } returns "Auditing"
+            every { audit.insertionPointCount() } returns 2
+            every { audit.issues() } returns emptyList()
+            every { audit.delete() } just runs
+            restartWithProfessionalEdition()
+
+            runBlocking {
+                val result = client.callTool(
+                    "start_burp_audit", mapOf(
+                        "requests" to listOf(
+                            mapOf(
+                                "targetHostname" to "example.com",
+                                "targetPort" to 443,
+                                "usesHttps" to true,
+                                "content" to "GET /search?q=test HTTP/1.1\r\nHost: example.com\r\n\r\n"
+                            )
+                        ),
+                        "auditConfiguration" to "active",
+                        "taskName" to "test-audit"
+                    )
+                )
+                delay(100)
+                val text = result.expectTextContent()
+                assertTrue(text.contains("\"taskType\":\"audit\""), text)
+                assertTrue(text.contains("\"insertionPointCount\":2"), text)
+                assertTrue(text.contains("\"issueCount\":0"), text)
+            }
+
+            verify(exactly = 1) { audit.addRequest(any()) }
+        }
+
+        @Test
+        fun `get site map request responses should paginate entries`() {
+            val siteMap = mockk<SiteMap>()
+            val item1 = mockk<burp.api.montoya.http.message.HttpRequestResponse>()
+            val item2 = mockk<burp.api.montoya.http.message.HttpRequestResponse>()
+            every { api.siteMap() } returns siteMap
+            every { siteMap.requestResponses() } returns listOf(item1, item2)
+            mockkStatic("net.portswigger.mcp.schema.SerializationKt")
+            every { item1.toSerializableForm() } returns HttpRequestResponse(
+                request = "GET /one HTTP/1.1",
+                response = "HTTP/1.1 200 OK",
+                notes = null
+            )
+            every { item2.toSerializableForm() } returns HttpRequestResponse(
+                request = "GET /two HTTP/1.1",
+                response = "HTTP/1.1 200 OK",
+                notes = null
+            )
+            restartWithProfessionalEdition()
+
+            runBlocking {
+                val result = client.callTool(
+                    "get_site_map_request_responses", mapOf(
+                        "count" to 1,
+                        "offset" to 1
+                    )
+                )
+                delay(100)
+                val text = result.expectTextContent()
+                assertFalse(text.contains("/one"), text)
+                assertTrue(text.contains("/two"), text)
             }
         }
     }
