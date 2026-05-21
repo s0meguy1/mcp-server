@@ -169,6 +169,34 @@ fun Server.registerTools(api: MontoyaApi, config: McpConfig) {
         api.burpSuite().exportUserOptionsAsJson()
     }
 
+    mcpTool<GetCookieJar>(
+        "Returns Burp cookie-jar entries. Values are sensitive; callers must redact before storing or showing them."
+    ) {
+        val allowed = runBlocking {
+            HistoryAccessSecurity.checkHistoryAccessPermission(HistoryAccessType.HTTP_HISTORY, config)
+        }
+        if (!allowed) {
+            api.logging().logToOutput("MCP cookie jar access denied")
+            return@mcpTool "Cookie jar access denied by Burp Suite"
+        }
+
+        val boundedOffset = offset.coerceAtLeast(0)
+        val boundedCount = count.coerceIn(1, 500)
+        val cookieEntries = api.http().cookieJar().cookies()
+            .drop(boundedOffset)
+            .take(boundedCount)
+            .map { cookie ->
+                CookieJarEntry(
+                    name = cookie.name(),
+                    value = cookie.value(),
+                    domain = cookie.domain() ?: "",
+                    path = cookie.path() ?: "",
+                    expiration = cookie.expiration().map { it.toString() }.orElse(null),
+                )
+            }
+        Json.encodeToString(cookieEntries)
+    }
+
     val toolingDisabledMessage =
         "User has disabled configuration editing. They can enable it in the MCP tab in Burp by selecting 'Enable tools that can edit your config'"
 
@@ -481,6 +509,21 @@ data class SendToIntruder(
     override val targetPort: Int,
     override val usesHttps: Boolean
 ) : HttpServiceParams
+
+@Serializable
+data class GetCookieJar(
+    val count: Int = 200,
+    val offset: Int = 0
+)
+
+@Serializable
+data class CookieJarEntry(
+    val name: String,
+    val value: String,
+    val domain: String,
+    val path: String,
+    val expiration: String? = null
+)
 
 @Serializable
 data class StartBurpCrawl(
