@@ -790,6 +790,39 @@ class ToolsKtTest {
                 assertEquals("Reached end of items", result3.expectTextContent())
             }
         }
+
+        @Test
+        fun `paginated tools should cap oversized count requests`() {
+            val proxy = mockk<Proxy>()
+            val proxyHistory = (1..30).map { mockk<ProxyHttpRequestResponse>() }
+
+            every { api.proxy() } returns proxy
+            every { proxy.history() } returns proxyHistory
+
+            mockkStatic("net.portswigger.mcp.schema.SerializationKt")
+
+            proxyHistory.forEachIndexed { index, item ->
+                every { item.toSerializableForm() } returns HttpRequestResponse(
+                    request = "GET /item${index + 1} HTTP/1.1",
+                    response = "HTTP/1.1 200 OK",
+                    notes = null
+                )
+            }
+
+            runBlocking {
+                val result = client.callTool(
+                    "get_proxy_http_history", mapOf(
+                        "count" to 500,
+                        "offset" to 0
+                    )
+                )
+
+                delay(100)
+                val text = result.expectTextContent()
+                assertTrue(text.contains("GET /item25 HTTP/1.1"), text)
+                assertFalse(text.contains("GET /item26 HTTP/1.1"), text)
+            }
+        }
     }
 
     @Nested

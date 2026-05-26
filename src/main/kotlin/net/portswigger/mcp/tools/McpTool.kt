@@ -11,6 +11,8 @@ import kotlinx.serialization.serializer
 import net.portswigger.mcp.schema.asInputSchema
 import kotlin.experimental.ExperimentalTypeInference
 
+const val MAX_PAGINATED_TOOL_ITEMS = 25
+
 @OptIn(InternalSerializationApi::class)
 inline fun <reified I : Any> Server.mcpTool(
     description: String,
@@ -76,16 +78,18 @@ inline fun <reified I : Paginated, J : Any> Server.mcpPaginatedTool(
     mcpTool<I>(description, execute = {
 
         val items = execute(this)
+        val boundedOffset = offset.coerceAtLeast(0)
 
         when {
-            offset >= items.size -> {
+            boundedOffset >= items.size -> {
                 "Reached end of items"
             }
 
             else -> {
-                val upperLimit = (offset + count).coerceAtMost(items.size)
+                val boundedCount = count.coerceIn(1, MAX_PAGINATED_TOOL_ITEMS)
+                val upperLimit = (boundedOffset + boundedCount).coerceAtMost(items.size)
 
-                items.subList(offset, upperLimit)
+                items.subList(boundedOffset, upperLimit)
                     .joinToString(separator = "\n\n", transform = mapper)
             }
         }
@@ -98,7 +102,9 @@ inline fun <reified I : Paginated> Server.mcpPaginatedTool(
 ) {
     mcpTool<I>(description, execute = {
         val seq = execute(this)
-        val paginated = seq.drop(offset).take(count).toList()
+        val boundedOffset = offset.coerceAtLeast(0)
+        val boundedCount = count.coerceIn(1, MAX_PAGINATED_TOOL_ITEMS)
+        val paginated = seq.drop(boundedOffset).take(boundedCount).toList()
 
         if (paginated.isEmpty()) {
             listOf(TextContent("Reached end of items"))
@@ -157,4 +163,3 @@ interface Paginated {
     val count: Int
     val offset: Int
 }
-

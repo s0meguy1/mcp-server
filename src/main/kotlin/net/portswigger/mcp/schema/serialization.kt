@@ -1,17 +1,103 @@
 package net.portswigger.mcp.schema
 
 import burp.api.montoya.collaborator.Interaction as CollaboratorInteraction
+import burp.api.montoya.http.message.HttpHeader
+import burp.api.montoya.http.message.HttpMessage
 import burp.api.montoya.proxy.ProxyHttpRequestResponse
+import burp.api.montoya.http.message.requests.HttpRequest
+import burp.api.montoya.http.message.responses.HttpResponse
 import burp.api.montoya.proxy.ProxyWebSocketMessage
 import burp.api.montoya.scanner.audit.issues.AuditIssue
 import burp.api.montoya.websocket.Direction
 import kotlinx.serialization.Serializable
 
+private const val MAX_TEXT_FIELD_CHARS = 4_000
+private const val MAX_HEADER_CHARS = 4_000
+private const val MAX_BODY_PREVIEW_BYTES = 2_048
+private const val MAX_MESSAGE_CHARS = 8_000
+
+private fun boundedText(value: String?, maxChars: Int = MAX_TEXT_FIELD_CHARS): String? {
+    if (value == null || value.length <= maxChars) {
+        return value
+    }
+    return value.take(maxChars) + "... (truncated, ${value.length} chars total)"
+}
+
+private fun boundedHeaders(headers: List<HttpHeader>): String {
+    return boundedText(headers.joinToString("\r\n") { it.toString() }, MAX_HEADER_CHARS) ?: ""
+}
+
+private fun boundedBody(message: HttpMessage?): String {
+    val body = message?.body() ?: return ""
+    val bodyLength = body.length()
+    if (bodyLength <= 0) {
+        return ""
+    }
+
+    val previewBytes = minOf(bodyLength, MAX_BODY_PREVIEW_BYTES)
+    val preview = boundedText(body.subArray(0, previewBytes).toString(), MAX_BODY_PREVIEW_BYTES) ?: ""
+    if (bodyLength <= MAX_BODY_PREVIEW_BYTES) {
+        return preview
+    }
+    return preview + "\r\n... (truncated body, $bodyLength bytes total)"
+}
+
+private fun boundedRequest(request: HttpRequest?): String {
+    if (request == null) {
+        return "<no request>"
+    }
+
+    val message = try {
+        val body = boundedBody(request)
+        buildString {
+            append(request.method())
+            append(" ")
+            append(request.path())
+            append(" ")
+            append(request.httpVersion())
+            append("\r\n")
+            append(boundedHeaders(request.headers()))
+            append("\r\n\r\n")
+            append(body)
+        }
+    } catch (_: Exception) {
+        request.toString()
+    }
+    return boundedText(message, MAX_MESSAGE_CHARS) ?: ""
+}
+
+private fun boundedResponse(response: HttpResponse?): String {
+    if (response == null) {
+        return "<no response>"
+    }
+
+    val message = try {
+        val reason = response.reasonPhrase().takeIf { it.isNotBlank() }
+        val body = boundedBody(response)
+        buildString {
+            append(response.httpVersion())
+            append(" ")
+            append(response.statusCode())
+            if (reason != null) {
+                append(" ")
+                append(reason)
+            }
+            append("\r\n")
+            append(boundedHeaders(response.headers()))
+            append("\r\n\r\n")
+            append(body)
+        }
+    } catch (_: Exception) {
+        response.toString()
+    }
+    return boundedText(message, MAX_MESSAGE_CHARS) ?: ""
+}
+
 fun AuditIssue.toSerializableForm(): IssueDetails {
     return IssueDetails(
         name = name(),
-        detail = detail(),
-        remediation = remediation(),
+        detail = boundedText(detail()),
+        remediation = boundedText(remediation()),
         httpService = HttpService(
             host = httpService().host(),
             port = httpService().port(),
@@ -29,8 +115,8 @@ fun AuditIssue.toSerializableForm(): IssueDetails {
         },
         definition = AuditIssueDefinition(
             id = definition().name(),
-            background = definition().background(),
-            remediation = definition().remediation(),
+            background = boundedText(definition().background()),
+            remediation = boundedText(definition().remediation()),
             typeIndex = definition().typeIndex(),
         )
     )
@@ -38,16 +124,16 @@ fun AuditIssue.toSerializableForm(): IssueDetails {
 
 fun burp.api.montoya.http.message.HttpRequestResponse.toSerializableForm(): HttpRequestResponse {
     return HttpRequestResponse(
-        request = request()?.toString() ?: "<no request>",
-        response = response()?.toString() ?: "<no response>",
+        request = boundedRequest(request()),
+        response = boundedResponse(response()),
         notes = annotations().notes()
     )
 }
 
 fun ProxyHttpRequestResponse.toSerializableForm(): HttpRequestResponse {
     return HttpRequestResponse(
-        request = request()?.toString() ?: "<no request>",
-        response = response()?.toString() ?: "<no response>",
+        request = boundedRequest(request()),
+        response = boundedResponse(response()),
         notes = annotations().notes()
     )
 }
@@ -150,8 +236,8 @@ fun CollaboratorInteraction.toSerializableForm(): CollaboratorInteractionDetails
         httpDetails = httpDetails().orElse(null)?.let {
             CollaboratorHttpDetails(
                 protocol = it.protocol().name,
-                request = it.requestResponse()?.request()?.toString(),
-                response = it.requestResponse()?.response()?.toString()
+                request = boundedRequest(it.requestResponse()?.request()),
+                response = boundedResponse(it.requestResponse()?.response())
             )
         },
         smtpDetails = smtpDetails().orElse(null)?.let {
