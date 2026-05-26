@@ -9,7 +9,10 @@ import burp.api.montoya.http.Http
 import burp.api.montoya.http.HttpMode
 import burp.api.montoya.http.HttpProtocol
 import burp.api.montoya.http.message.HttpHeader
+import burp.api.montoya.http.message.params.HttpParameterType
+import burp.api.montoya.http.message.params.ParsedHttpParameter
 import burp.api.montoya.http.message.requests.HttpRequest
+import burp.api.montoya.http.message.responses.HttpResponse
 import burp.api.montoya.logging.Logging
 import burp.api.montoya.persistence.PersistedObject
 import burp.api.montoya.proxy.Proxy
@@ -933,6 +936,203 @@ class ToolsKtTest {
                 assertFalse(text.contains("/one"), text)
                 assertTrue(text.contains("/two"), text)
             }
+        }
+
+        @Test
+        fun `endpoint inventory should return compact grouped metadata without bodies`() {
+            val proxy = mockk<Proxy>()
+            val item = mockk<ProxyHttpRequestResponse>()
+            val request = mockHttpRequest(
+                method = "GET",
+                path = "/rest/products/search?q=apple&token=secret",
+                url = "https://example.com/rest/products/search?q=apple&token=secret",
+                parameters = listOf(
+                    mockParameter("q", "apple", HttpParameterType.URL),
+                    mockParameter("token", "secret", HttpParameterType.URL),
+                ),
+            )
+            val response = mockHttpResponse(
+                statusCode = 200,
+                contentType = "application/json",
+                body = "{\"secret\":\"large-response-body\"}",
+            )
+
+            every { api.proxy() } returns proxy
+            every { proxy.history() } returns listOf(item)
+            every { item.id() } returns 42
+            every { item.request() } returns request
+            every { item.response() } returns response
+            every { item.method() } returns "GET"
+            every { item.url() } returns "https://example.com/rest/products/search?q=apple&token=secret"
+            every { item.path() } returns "/rest/products/search"
+            every { item.host() } returns "example.com"
+            every { item.port() } returns 443
+            every { item.secure() } returns true
+            restartWithProfessionalEdition()
+
+            runBlocking {
+                val result = client.callTool(
+                    "get_burp_endpoint_inventory", mapOf(
+                        "source" to "proxy_history",
+                        "query" to "products",
+                        "count" to 10,
+                        "offset" to 0
+                    )
+                )
+                delay(100)
+                val text = result.expectTextContent()
+                assertTrue(text.contains("\"pathTemplate\":\"/rest/products/search\""), text)
+                assertTrue(text.contains("\"exampleUrl\":\"https://example.com/rest/products/search\""), text)
+                assertTrue(text.contains("\"queryParameters\":[\"q\",\"token\"]"), text)
+                assertTrue(text.contains("\"sampleReferences\":[\"proxy:42\"]"), text)
+                assertFalse(text.contains("q=apple"), text)
+                assertFalse(text.contains("token=secret"), text)
+                assertFalse(text.contains("large-response-body"), text)
+            }
+        }
+
+        @Test
+        fun `parameter inventory should omit values and request response lookup should bound selected evidence`() {
+            val proxy = mockk<Proxy>()
+            val item = mockk<ProxyHttpRequestResponse>()
+            val request = mockHttpRequest(
+                method = "POST",
+                path = "/login",
+                url = "https://example.com/login",
+                body = "email=user@example.com&password=super-secret-password",
+                parameters = listOf(
+                    mockParameter("email", "user@example.com", HttpParameterType.BODY),
+                    mockParameter("password", "super-secret-password", HttpParameterType.BODY),
+                ),
+            )
+            val response = mockHttpResponse(
+                statusCode = 302,
+                contentType = "text/html",
+                body = "login accepted with token=server-secret-token",
+            )
+
+            every { api.proxy() } returns proxy
+            every { proxy.history() } returns listOf(item)
+            every { item.id() } returns 77
+            every { item.request() } returns request
+            every { item.response() } returns response
+            every { item.method() } returns "POST"
+            every { item.url() } returns "https://example.com/login"
+            every { item.path() } returns "/login"
+            every { item.host() } returns "example.com"
+            every { item.port() } returns 443
+            every { item.secure() } returns true
+            restartWithProfessionalEdition()
+
+            runBlocking {
+                val inventory = client.callTool(
+                    "get_burp_parameter_inventory", mapOf(
+                        "source" to "proxy_history",
+                        "query" to "login",
+                        "count" to 10,
+                        "offset" to 0
+                    )
+                )
+                delay(100)
+                val inventoryText = inventory.expectTextContent()
+                assertTrue(inventoryText.contains("\"name\":\"password\""), inventoryText)
+                assertTrue(inventoryText.contains("\"sensitiveName\":true"), inventoryText)
+                assertFalse(inventoryText.contains("super-secret-password"), inventoryText)
+
+                val lookup = client.callTool(
+                    "get_burp_request_response_by_id", mapOf(
+                        "reference" to "proxy:77",
+                        "bodyMode" to "preview",
+                        "maxBodyBytes" to 12
+                    )
+                )
+                delay(100)
+                val lookupText = lookup.expectTextContent()
+                assertTrue(lookupText.contains("\"reference\":\"proxy:77\""), lookupText)
+                assertTrue(lookupText.contains("\"bodyTruncated\":true"), lookupText)
+                assertTrue(lookupText.contains("[REDACTED]"), lookupText)
+                assertFalse(lookupText.contains("super-secret-password"), lookupText)
+                assertFalse(lookupText.contains("server-secret-token"), lookupText)
+            }
+        }
+    }
+
+    private fun mockParameter(name: String, value: String, type: HttpParameterType): ParsedHttpParameter {
+        return mockk<ParsedHttpParameter>().also {
+            every { it.name() } returns name
+            every { it.value() } returns value
+            every { it.type() } returns type
+        }
+    }
+
+    private fun mockHttpRequest(
+        method: String,
+        path: String,
+        url: String,
+        body: String = "",
+        parameters: List<ParsedHttpParameter> = emptyList(),
+    ): HttpRequest {
+        val bodyBytes = mockBody(body)
+        val headers = listOf(
+            mockHeader("Host", "example.com"),
+            mockHeader("Content-Type", "application/x-www-form-urlencoded"),
+            mockHeader("Authorization", "Bearer request-secret-token"),
+        )
+        val service = mockk<burp.api.montoya.http.HttpService>().also {
+            every { it.host() } returns "example.com"
+            every { it.port() } returns 443
+            every { it.secure() } returns true
+        }
+        return mockk<HttpRequest>().also {
+            every { it.method() } returns method
+            every { it.path() } returns path
+            every { it.pathWithoutQuery() } returns path.substringBefore("?")
+            every { it.url() } returns url
+            every { it.fileExtension() } returns ""
+            every { it.parameters() } returns parameters
+            every { it.headers() } returns headers
+            every { it.httpVersion() } returns "HTTP/1.1"
+            every { it.body() } returns bodyBytes
+            every { it.httpService() } returns service
+        }
+    }
+
+    private fun mockHttpResponse(statusCode: Int, contentType: String, body: String): HttpResponse {
+        val bodyBytes = mockBody(body)
+        val headers = listOf(
+            mockHeader("Content-Type", contentType),
+            mockHeader("Set-Cookie", "session=response-secret-cookie"),
+        )
+        return mockk<HttpResponse>().also {
+            every { it.statusCode() } returns statusCode.toShort()
+            every { it.reasonPhrase() } returns if (statusCode in 300..399) "Found" else "OK"
+            every { it.headerValue("Content-Type") } returns contentType
+            every { it.headers() } returns headers
+            every { it.httpVersion() } returns "HTTP/1.1"
+            every { it.body() } returns bodyBytes
+            every { it.mimeType().name } returns "JSON"
+        }
+    }
+
+    private fun mockHeader(name: String, value: String): HttpHeader {
+        return mockk<HttpHeader>().also {
+            every { it.name() } returns name
+            every { it.value() } returns value
+            every { it.toString() } returns "$name: $value"
+        }
+    }
+
+    private fun mockBody(content: String): ByteArray {
+        return mockk<ByteArray>().also { body ->
+            every { body.length() } returns content.toByteArray().size
+            every { body.subArray(any(), any()) } answers {
+                val start = firstArg<Int>()
+                val end = secondArg<Int>()
+                mockk<ByteArray>().also {
+                    every { it.toString() } returns content.substring(start, end.coerceAtMost(content.length))
+                }
+            }
+            every { body.toString() } returns content
         }
     }
     

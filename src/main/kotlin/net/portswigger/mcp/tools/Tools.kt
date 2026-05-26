@@ -8,7 +8,9 @@ import burp.api.montoya.core.BurpSuiteEdition
 import burp.api.montoya.http.HttpMode
 import burp.api.montoya.http.HttpService
 import burp.api.montoya.http.message.HttpHeader
+import burp.api.montoya.http.message.params.ParsedHttpParameter
 import burp.api.montoya.http.message.requests.HttpRequest
+import burp.api.montoya.http.message.responses.HttpResponse
 import burp.api.montoya.scanner.AuditConfiguration
 import burp.api.montoya.scanner.BuiltInAuditConfiguration
 import burp.api.montoya.scanner.CrawlConfiguration
@@ -50,6 +52,546 @@ private fun truncateIfNeeded(serialized: String): String {
     } else {
         serialized
     }
+}
+
+private const val MAX_INVENTORY_ITEMS = 100
+private const val MAX_INVENTORY_SAMPLE_REFERENCES = 5
+private const val DEFAULT_LOOKUP_BODY_BYTES = 4096
+private const val MAX_LOOKUP_BODY_BYTES = 20_000
+
+private val sensitiveHeaderNames = setOf(
+    "authorization",
+    "cookie",
+    "proxy-authorization",
+    "set-cookie",
+    "x-api-key",
+    "x-auth-token",
+)
+
+private val sensitiveParameterNames = setOf(
+    "password",
+    "pass",
+    "passwd",
+    "token",
+    "access_token",
+    "refresh_token",
+    "id_token",
+    "secret",
+    "api_key",
+    "apikey",
+)
+
+private val staticExtensions = setOf(
+    "css",
+    "js",
+    "mjs",
+    "map",
+    "png",
+    "jpg",
+    "jpeg",
+    "gif",
+    "webp",
+    "svg",
+    "ico",
+    "woff",
+    "woff2",
+    "ttf",
+    "eot",
+    "otf",
+    "mp3",
+    "mp4",
+    "webm",
+    "avi",
+    "mov",
+    "pdf",
+)
+
+private fun <T> safeValue(block: () -> T?): T? = try {
+    block()
+} catch (_: Exception) {
+    null
+}
+
+private data class ObservedExchange(
+    val reference: String,
+    val source: String,
+    val request: HttpRequest?,
+    val response: HttpResponse?,
+    val method: String,
+    val url: String,
+    val path: String,
+    val host: String,
+    val port: Int,
+    val secure: Boolean,
+)
+
+private fun requestedInventorySources(source: String): Set<String> {
+    return when (source.trim().lowercase()) {
+        "proxy", "proxy_history", "history" -> setOf("proxy_history")
+        "site", "site_map", "sitemap" -> setOf("site_map")
+        else -> setOf("proxy_history", "site_map")
+    }
+}
+
+private fun collectObservedExchanges(api: MontoyaApi, source: String): List<ObservedExchange> {
+    val sources = requestedInventorySources(source)
+    val exchanges = mutableListOf<ObservedExchange>()
+    if ("proxy_history" in sources) {
+        safeValue { api.proxy().history() }.orEmpty().forEach { item ->
+            val request = safeValue { item.request() }
+            val response = safeValue { item.response() }
+            exchanges.add(
+                ObservedExchange(
+                    reference = "proxy:${safeValue { item.id() } ?: exchanges.size}",
+                    source = "proxy_history",
+                    request = request,
+                    response = response,
+                    method = safeValue { item.method() } ?: safeValue { request?.method() } ?: "",
+                    url = safeValue { item.url() } ?: safeValue { request?.url() } ?: "",
+                    path = safeValue { item.path() } ?: safeValue { request?.pathWithoutQuery() } ?: "",
+                    host = safeValue { item.host() } ?: safeValue { request?.httpService()?.host() } ?: "",
+                    port = safeValue { item.port() } ?: safeValue { request?.httpService()?.port() } ?: 0,
+                    secure = safeValue { item.secure() } ?: safeValue { request?.httpService()?.secure() } ?: false,
+                )
+            )
+        }
+    }
+    if ("site_map" in sources) {
+        safeValue { api.siteMap().requestResponses() }.orEmpty().forEachIndexed { index, item ->
+            val request = safeValue { item.request() }
+            val response = safeValue { item.response() }
+            val service = safeValue { item.httpService() } ?: safeValue { request?.httpService() }
+            exchanges.add(
+                ObservedExchange(
+                    reference = "site:$index",
+                    source = "site_map",
+                    request = request,
+                    response = response,
+                    method = safeValue { request?.method() } ?: "",
+                    url = safeValue { item.url() } ?: safeValue { request?.url() } ?: "",
+                    path = safeValue { request?.pathWithoutQuery() } ?: safeValue { request?.path() } ?: "",
+                    host = safeValue { service?.host() } ?: "",
+                    port = safeValue { service?.port() } ?: 0,
+                    secure = safeValue { service?.secure() } ?: false,
+                )
+            )
+        }
+    }
+    return exchanges
+}
+
+private fun matchesInventoryFilters(
+    exchange: ObservedExchange,
+    query: String?,
+    regex: String?,
+    methods: List<String>,
+): Boolean {
+    val methodSet = methods.map { it.uppercase() }.filter { it.isNotBlank() }.toSet()
+    if (methodSet.isNotEmpty() && exchange.method.uppercase() !in methodSet) {
+        return false
+    }
+    val haystack = buildString {
+        append(exchange.method).append('\n')
+        append(exchange.url).append('\n')
+        append(exchange.path).append('\n')
+        append(exchange.host).append('\n')
+        append(parameterSummaries(exchange.request).joinToString("\n") { "${it.location}:${it.name}" })
+        append('\n')
+        append(contentType(exchange.response).orEmpty())
+        append('\n')
+        append(statusCode(exchange.response)?.toString().orEmpty())
+    }
+    val queryText = query?.trim()?.lowercase().orEmpty()
+    if (queryText.isNotBlank() && !haystack.lowercase().contains(queryText)) {
+        return false
+    }
+    if (!regex.isNullOrBlank() && !Pattern.compile(regex, Pattern.CASE_INSENSITIVE).matcher(haystack).find()) {
+        return false
+    }
+    return true
+}
+
+private fun isStaticExchange(exchange: ObservedExchange): Boolean {
+    val extension = safeValue { exchange.request?.fileExtension() }
+        ?: exchange.path.substringAfterLast('.', missingDelimiterValue = "")
+    if (extension.lowercase() in staticExtensions) {
+        return true
+    }
+    val mime = safeValue { exchange.response?.mimeType()?.name }?.lowercase().orEmpty()
+    return mime in setOf(
+        "css",
+        "script",
+        "image_unknown",
+        "image_jpeg",
+        "image_gif",
+        "image_png",
+        "image_bmp",
+        "image_tiff",
+        "image_svg_xml",
+        "font_woff",
+        "font_woff2",
+        "sound",
+        "video",
+    )
+}
+
+private fun endpointInventory(
+    api: MontoyaApi,
+    params: GetBurpEndpointInventory,
+): EndpointInventoryResponse {
+    val includeStatic = params.includeStatic
+    val groups = linkedMapOf<String, EndpointInventoryItem>()
+    for (exchange in collectObservedExchanges(api, params.source)) {
+        if (exchange.url.isBlank() || exchange.method.isBlank()) continue
+        if (!includeStatic && isStaticExchange(exchange)) continue
+        if (!matchesInventoryFilters(exchange, params.query, params.regex, params.methods)) continue
+        val pathTemplate = templatePath(exchange.path.ifBlank { pathFromUrl(exchange.url) })
+        val key = listOf(exchange.method.uppercase(), exchange.host, exchange.port, exchange.secure, pathTemplate).joinToString("|")
+        val existing = groups[key]
+        val parameters = parameterSummaries(exchange.request)
+        val next = if (existing == null) {
+            EndpointInventoryItem(
+                method = exchange.method.uppercase(),
+                pathTemplate = pathTemplate,
+                exampleUrl = inventoryExampleUrl(exchange.url, pathTemplate),
+                host = exchange.host,
+                port = exchange.port,
+                secure = exchange.secure,
+                sources = listOf(exchange.source),
+                observedCount = 1,
+                sampleReferences = listOf(exchange.reference),
+                statusCodes = statusCode(exchange.response)?.let { listOf(it) }.orEmpty(),
+                contentTypes = contentType(exchange.response)?.let { listOf(it) }.orEmpty(),
+                queryParameters = parameters.filter { it.location == "URL" }.map { it.name }.distinct().sorted(),
+                bodyParameters = parameters.filter { it.location != "URL" && it.location != "COOKIE" }.map { it.name }.distinct().sorted(),
+                cookieParameters = parameters.filter { it.location == "COOKIE" }.map { it.name }.distinct().sorted(),
+                requestHeaderNames = headerNames(safeValue { exchange.request?.headers() }).sorted(),
+                responseHeaderNames = headerNames(safeValue { exchange.response?.headers() }).sorted(),
+                hasRequestBody = bodyLength(exchange.request) > 0,
+                hasResponseBody = bodyLength(exchange.response) > 0,
+            )
+        } else {
+            existing.merge(exchange, parameters)
+        }
+        groups[key] = next
+    }
+
+    val items = groups.values
+        .sortedWith(compareByDescending<EndpointInventoryItem> { it.observedCount }.thenBy { it.pathTemplate }.thenBy { it.method })
+    val offset = params.offset.coerceAtLeast(0)
+    val count = params.count.coerceIn(1, MAX_INVENTORY_ITEMS)
+    return EndpointInventoryResponse(
+        source = params.source,
+        query = params.query,
+        regex = params.regex,
+        total = items.size,
+        offset = offset,
+        returned = items.drop(offset).take(count).size,
+        items = items.drop(offset).take(count),
+        note = "Compact endpoint inventory only. Use sampleReferences with get_burp_request_response_by_id for selected raw evidence.",
+    )
+}
+
+private fun parameterInventory(
+    api: MontoyaApi,
+    params: GetBurpParameterInventory,
+): ParameterInventoryResponse {
+    val groups = linkedMapOf<String, ParameterInventoryItem>()
+    for (exchange in collectObservedExchanges(api, params.source)) {
+        if (exchange.url.isBlank() || exchange.method.isBlank()) continue
+        if (!params.includeStatic && isStaticExchange(exchange)) continue
+        if (!matchesInventoryFilters(exchange, params.query, params.regex, params.methods)) continue
+        val pathTemplate = templatePath(exchange.path.ifBlank { pathFromUrl(exchange.url) })
+        for (parameter in parameterSummaries(exchange.request)) {
+            if (parameter.location == "COOKIE" && !params.includeCookies) continue
+            val key = listOf(exchange.method.uppercase(), pathTemplate, parameter.location, parameter.name).joinToString("|")
+            val existing = groups[key]
+            groups[key] = if (existing == null) {
+                ParameterInventoryItem(
+                    name = parameter.name,
+                    location = parameter.location,
+                    method = exchange.method.uppercase(),
+                    pathTemplate = pathTemplate,
+                    exampleUrl = inventoryExampleUrl(exchange.url, pathTemplate),
+                    sources = listOf(exchange.source),
+                    observedCount = 1,
+                    sampleReferences = listOf(exchange.reference),
+                    valueShape = parameter.valueShape,
+                    sensitiveName = parameter.name.lowercase() in sensitiveParameterNames,
+                )
+            } else {
+                existing.merge(exchange, parameter)
+            }
+        }
+    }
+    val items = groups.values
+        .sortedWith(compareByDescending<ParameterInventoryItem> { it.observedCount }.thenBy { it.pathTemplate }.thenBy { it.name })
+    val offset = params.offset.coerceAtLeast(0)
+    val count = params.count.coerceIn(1, MAX_INVENTORY_ITEMS)
+    return ParameterInventoryResponse(
+        source = params.source,
+        query = params.query,
+        regex = params.regex,
+        total = items.size,
+        offset = offset,
+        returned = items.drop(offset).take(count).size,
+        items = items.drop(offset).take(count),
+        note = "Parameter names and value shapes only; raw values are intentionally omitted.",
+    )
+}
+
+private fun findExchangeByReference(api: MontoyaApi, reference: String): ObservedExchange? {
+    val trimmed = reference.trim()
+    val source = trimmed.substringBefore(":", missingDelimiterValue = "").lowercase()
+    val idText = trimmed.substringAfter(":", missingDelimiterValue = "")
+    if (source == "proxy") {
+        val id = idText.toIntOrNull() ?: return null
+        return collectObservedExchanges(api, "proxy_history").firstOrNull { it.reference == "proxy:$id" }
+    }
+    if (source == "site") {
+        val index = idText.toIntOrNull() ?: return null
+        return collectObservedExchanges(api, "site_map").firstOrNull { it.reference == "site:$index" }
+    }
+    return null
+}
+
+private fun requestResponseLookup(
+    api: MontoyaApi,
+    params: GetBurpRequestResponseById,
+): RequestResponseLookup {
+    val exchange = findExchangeByReference(api, params.reference)
+    if (exchange == null) {
+        return RequestResponseLookup(
+            reference = params.reference,
+            source = null,
+            found = false,
+            request = null,
+            response = null,
+            note = "Reference not found. Use sampleReferences from get_burp_endpoint_inventory or get_burp_parameter_inventory.",
+        )
+    }
+    val bodyMode = when (params.bodyMode.trim().lowercase()) {
+        "none", "metadata" -> "metadata"
+        "full" -> "full"
+        else -> "preview"
+    }
+    val maxBodyBytes = params.maxBodyBytes.coerceIn(0, MAX_LOOKUP_BODY_BYTES)
+        .takeIf { it > 0 } ?: DEFAULT_LOOKUP_BODY_BYTES
+    return RequestResponseLookup(
+        reference = exchange.reference,
+        source = exchange.source,
+        found = true,
+        request = httpRequestEvidence(exchange.request, bodyMode, maxBodyBytes),
+        response = httpResponseEvidence(exchange.response, bodyMode, maxBodyBytes),
+        note = "Auth/cookie-like header values are redacted. Bodies are bounded by maxBodyBytes.",
+    )
+}
+
+private fun EndpointInventoryItem.merge(
+    exchange: ObservedExchange,
+    parameters: List<ParameterSummary>,
+): EndpointInventoryItem {
+    return copy(
+        sources = (sources + exchange.source).distinct().sorted(),
+        observedCount = observedCount + 1,
+        sampleReferences = (sampleReferences + exchange.reference).distinct().take(MAX_INVENTORY_SAMPLE_REFERENCES),
+        statusCodes = (statusCodes + statusCode(exchange.response)).filterNotNull().distinct().sorted(),
+        contentTypes = (contentTypes + contentType(exchange.response)).filterNotNull().distinct().sorted(),
+        queryParameters = (queryParameters + parameters.filter { it.location == "URL" }.map { it.name }).distinct().sorted(),
+        bodyParameters = (bodyParameters + parameters.filter { it.location != "URL" && it.location != "COOKIE" }.map { it.name }).distinct().sorted(),
+        cookieParameters = (cookieParameters + parameters.filter { it.location == "COOKIE" }.map { it.name }).distinct().sorted(),
+        requestHeaderNames = (requestHeaderNames + headerNames(safeValue { exchange.request?.headers() })).distinct().sorted(),
+        responseHeaderNames = (responseHeaderNames + headerNames(safeValue { exchange.response?.headers() })).distinct().sorted(),
+        hasRequestBody = hasRequestBody || bodyLength(exchange.request) > 0,
+        hasResponseBody = hasResponseBody || bodyLength(exchange.response) > 0,
+    )
+}
+
+private fun ParameterInventoryItem.merge(
+    exchange: ObservedExchange,
+    parameter: ParameterSummary,
+): ParameterInventoryItem {
+    return copy(
+        sources = (sources + exchange.source).distinct().sorted(),
+        observedCount = observedCount + 1,
+        sampleReferences = (sampleReferences + exchange.reference).distinct().take(MAX_INVENTORY_SAMPLE_REFERENCES),
+        valueShape = listOf(valueShape, parameter.valueShape).filter { it.isNotBlank() }.distinct().joinToString("|"),
+        sensitiveName = sensitiveName || parameter.name.lowercase() in sensitiveParameterNames,
+    )
+}
+
+private fun statusCode(response: HttpResponse?): Int? = safeValue { response?.statusCode()?.toInt() }
+
+private fun contentType(response: HttpResponse?): String? {
+    return safeValue { response?.headerValue("Content-Type") }
+        ?: safeValue { response?.mimeType()?.name }
+}
+
+private fun bodyLength(message: burp.api.montoya.http.message.HttpMessage?): Int {
+    return safeValue { message?.body()?.length() } ?: 0
+}
+
+private fun headerNames(headers: List<HttpHeader>?): List<String> {
+    return headers.orEmpty()
+        .mapNotNull { safeValue { it.name() }?.takeIf { name -> name.isNotBlank() } }
+        .distinct()
+        .take(80)
+}
+
+private fun redactedHeaders(headers: List<HttpHeader>?): Map<String, String> {
+    return headers.orEmpty().take(80).mapNotNull { header ->
+        val name = safeValue { header.name() } ?: return@mapNotNull null
+        val value = safeValue { header.value() }.orEmpty()
+        name to if (name.lowercase() in sensitiveHeaderNames) "[REDACTED]" else value.take(500)
+    }.toMap()
+}
+
+private data class ParameterSummary(
+    val name: String,
+    val location: String,
+    val valueShape: String,
+)
+
+private fun parameterSummaries(request: HttpRequest?): List<ParameterSummary> {
+    val parsed = safeValue { request?.parameters() }.orEmpty()
+        .mapNotNull { parameterSummary(it) }
+    if (parsed.isNotEmpty()) {
+        return parsed.distinctBy { "${it.location}:${it.name}" }
+    }
+    return queryParameterNamesFromUrl(safeValue { request?.url() }.orEmpty())
+        .map { ParameterSummary(it, "URL", "unknown") }
+}
+
+private fun parameterSummary(parameter: ParsedHttpParameter): ParameterSummary? {
+    val name = safeValue { parameter.name() }?.takeIf { it.isNotBlank() } ?: return null
+    val location = safeValue { parameter.type().name } ?: "UNKNOWN"
+    val value = safeValue { parameter.value() }.orEmpty()
+    return ParameterSummary(
+        name = name,
+        location = location,
+        valueShape = valueShape(value),
+    )
+}
+
+private fun queryParameterNamesFromUrl(url: String): List<String> {
+    val query = url.substringAfter('?', missingDelimiterValue = "")
+    if (query.isBlank()) return emptyList()
+    return query.split("&")
+        .mapNotNull { part -> part.substringBefore("=", missingDelimiterValue = "").takeIf { it.isNotBlank() } }
+        .distinct()
+}
+
+private fun valueShape(value: String): String {
+    if (value.isBlank()) return "empty"
+    if (value.length > 120) return "long_text"
+    if (value.matches(Regex("-?\\d+(\\.\\d+)?"))) return "number"
+    if (value.equals("true", true) || value.equals("false", true)) return "boolean"
+    if (value.matches(Regex("[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]*"))) return "jwt_like"
+    if (value.matches(Regex("[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"))) return "uuid"
+    if (value.contains("@") && value.length <= 120) return "email_like"
+    return "short_text"
+}
+
+private fun pathFromUrl(url: String): String {
+    return try {
+        URI(url).rawPath?.takeIf { it.isNotBlank() } ?: "/"
+    } catch (_: Exception) {
+        url.substringAfter("://", url).substringAfter("/", "/").substringBefore("?").let { if (it.startsWith("/")) it else "/$it" }
+    }
+}
+
+private fun inventoryExampleUrl(url: String, pathTemplate: String): String {
+    return try {
+        val uri = URI(url)
+        val scheme = uri.scheme ?: return pathTemplate
+        val authority = uri.rawAuthority?.substringAfter("@") ?: return pathTemplate
+        "$scheme://$authority$pathTemplate"
+    } catch (_: Exception) {
+        pathTemplate
+    }
+}
+
+private fun templatePath(path: String): String {
+    val normalized = if (path.isBlank()) "/" else path.substringBefore("?")
+    return normalized.split("/").joinToString("/") { segment ->
+        when {
+            segment.isBlank() -> segment
+            segment.matches(Regex("\\d+")) -> "{int}"
+            segment.matches(Regex("[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")) -> "{uuid}"
+            segment.length >= 16 && segment.matches(Regex("[0-9a-fA-F]+")) -> "{hex}"
+            segment.length >= 24 && segment.matches(Regex("[A-Za-z0-9_-]+")) -> "{token}"
+            else -> segment
+        }
+    }.ifBlank { "/" }
+}
+
+private fun httpRequestEvidence(
+    request: HttpRequest?,
+    bodyMode: String,
+    maxBodyBytes: Int,
+): HttpMessageEvidence? {
+    if (request == null) return null
+    val bodyBytes = bodyLength(request)
+    val bodyPreview = if (bodyMode == "metadata") null else boundedBodyPreview(request, maxBodyBytes)
+    return HttpMessageEvidence(
+        startLine = listOfNotNull(
+            safeValue { request.method() },
+            safeValue { request.path() },
+            safeValue { request.httpVersion() },
+        ).joinToString(" ").takeIf { it.isNotBlank() },
+        url = safeValue { request.url() },
+        statusCode = null,
+        headers = redactedHeaders(safeValue { request.headers() }),
+        headerNames = headerNames(safeValue { request.headers() }),
+        bodyBytes = bodyBytes,
+        bodyPreview = bodyPreview,
+        bodyTruncated = bodyMode != "metadata" && bodyBytes > maxBodyBytes,
+    )
+}
+
+private fun httpResponseEvidence(
+    response: HttpResponse?,
+    bodyMode: String,
+    maxBodyBytes: Int,
+): HttpMessageEvidence? {
+    if (response == null) return null
+    val bodyBytes = bodyLength(response)
+    val status = statusCode(response)
+    val reason = safeValue { response.reasonPhrase() }.orEmpty()
+    val bodyPreview = if (bodyMode == "metadata") null else boundedBodyPreview(response, maxBodyBytes)
+    return HttpMessageEvidence(
+        startLine = listOfNotNull(
+            safeValue { response.httpVersion() },
+            status?.toString(),
+            reason.takeIf { it.isNotBlank() },
+        ).joinToString(" ").takeIf { it.isNotBlank() },
+        url = null,
+        statusCode = status,
+        headers = redactedHeaders(safeValue { response.headers() }),
+        headerNames = headerNames(safeValue { response.headers() }),
+        bodyBytes = bodyBytes,
+        bodyPreview = bodyPreview,
+        bodyTruncated = bodyMode != "metadata" && bodyBytes > maxBodyBytes,
+    )
+}
+
+private fun boundedBodyPreview(
+    message: burp.api.montoya.http.message.HttpMessage,
+    maxBodyBytes: Int,
+): String {
+    val body = safeValue { message.body() } ?: return ""
+    val length = safeValue { body.length() } ?: return ""
+    if (length <= 0) return ""
+    val previewBytes = minOf(length, maxBodyBytes)
+    val preview = safeValue { body.subArray(0, previewBytes).toString() }.orEmpty()
+    return redactSecretLikeText(preview.take(maxBodyBytes))
+}
+
+private fun redactSecretLikeText(value: String): String {
+    return value
+        .replace(Regex("(?i)(password|pass|passwd|token|access_token|refresh_token|id_token|secret|api_key|apikey)([\"'\\s:=]+)([^&\\s\"'}]+)")) {
+            "${it.groupValues[1]}${it.groupValues[2]}[REDACTED]"
+        }
 }
 
 fun Server.registerTools(api: MontoyaApi, config: McpConfig) {
@@ -327,6 +869,51 @@ fun Server.registerTools(api: MontoyaApi, config: McpConfig) {
                 .filter { item -> compiledRegex?.matcher(item)?.find() ?: true }
         }
 
+        mcpTool<GetBurpEndpointInventory>(
+            "Returns compact grouped endpoint inventory from Burp proxy history and/or site map. " +
+                "Use this before raw history reads to discover routes, status codes, content types, parameters, and sampleReferences."
+        ) {
+            if ("proxy_history" in requestedInventorySources(source)) {
+                val allowed = runBlocking {
+                    checkHistoryPermissionOrDeny(HistoryAccessType.HTTP_HISTORY, config, api, "HTTP endpoint inventory")
+                }
+                if (!allowed) {
+                    return@mcpTool "HTTP history access denied by Burp Suite"
+                }
+            }
+            Json.encodeToString(endpointInventory(api, this))
+        }
+
+        mcpTool<GetBurpParameterInventory>(
+            "Returns compact grouped parameter inventory from Burp proxy history and/or site map. " +
+                "Values are never returned; use sampleReferences with get_burp_request_response_by_id for selected evidence."
+        ) {
+            if ("proxy_history" in requestedInventorySources(source)) {
+                val allowed = runBlocking {
+                    checkHistoryPermissionOrDeny(HistoryAccessType.HTTP_HISTORY, config, api, "HTTP parameter inventory")
+                }
+                if (!allowed) {
+                    return@mcpTool "HTTP history access denied by Burp Suite"
+                }
+            }
+            Json.encodeToString(parameterInventory(api, this))
+        }
+
+        mcpTool<GetBurpRequestResponseById>(
+            "Returns one bounded request/response selected by reference, such as proxy:123 or site:7. " +
+                "Use metadata or preview first; request full only for final evidence."
+        ) {
+            if (reference.trim().lowercase().startsWith("proxy:")) {
+                val allowed = runBlocking {
+                    checkHistoryPermissionOrDeny(HistoryAccessType.HTTP_HISTORY, config, api, "HTTP request/response lookup")
+                }
+                if (!allowed) {
+                    return@mcpTool "HTTP history access denied by Burp Suite"
+                }
+            }
+            Json.encodeToString(requestResponseLookup(api, this))
+        }
+
         val collaboratorClient by lazy { api.collaborator().createClient() }
 
         mcpTool<GenerateCollaboratorPayload>(
@@ -558,6 +1145,118 @@ data class GetSiteMapRequestResponses(
     override val offset: Int,
     val regex: String? = null
 ) : Paginated
+
+@Serializable
+data class GetBurpEndpointInventory(
+    val count: Int = 50,
+    val offset: Int = 0,
+    val source: String = "all",
+    val query: String? = null,
+    val regex: String? = null,
+    val methods: List<String> = emptyList(),
+    val includeStatic: Boolean = false,
+)
+
+@Serializable
+data class GetBurpParameterInventory(
+    val count: Int = 50,
+    val offset: Int = 0,
+    val source: String = "all",
+    val query: String? = null,
+    val regex: String? = null,
+    val methods: List<String> = emptyList(),
+    val includeStatic: Boolean = false,
+    val includeCookies: Boolean = false,
+)
+
+@Serializable
+data class GetBurpRequestResponseById(
+    val reference: String,
+    val bodyMode: String = "preview",
+    val maxBodyBytes: Int = DEFAULT_LOOKUP_BODY_BYTES,
+)
+
+@Serializable
+data class EndpointInventoryResponse(
+    val source: String,
+    val query: String?,
+    val regex: String?,
+    val total: Int,
+    val offset: Int,
+    val returned: Int,
+    val items: List<EndpointInventoryItem>,
+    val note: String,
+)
+
+@Serializable
+data class EndpointInventoryItem(
+    val method: String,
+    val pathTemplate: String,
+    val exampleUrl: String,
+    val host: String,
+    val port: Int,
+    val secure: Boolean,
+    val sources: List<String>,
+    val observedCount: Int,
+    val sampleReferences: List<String>,
+    val statusCodes: List<Int> = emptyList(),
+    val contentTypes: List<String> = emptyList(),
+    val queryParameters: List<String> = emptyList(),
+    val bodyParameters: List<String> = emptyList(),
+    val cookieParameters: List<String> = emptyList(),
+    val requestHeaderNames: List<String> = emptyList(),
+    val responseHeaderNames: List<String> = emptyList(),
+    val hasRequestBody: Boolean = false,
+    val hasResponseBody: Boolean = false,
+)
+
+@Serializable
+data class ParameterInventoryResponse(
+    val source: String,
+    val query: String?,
+    val regex: String?,
+    val total: Int,
+    val offset: Int,
+    val returned: Int,
+    val items: List<ParameterInventoryItem>,
+    val note: String,
+)
+
+@Serializable
+data class ParameterInventoryItem(
+    val name: String,
+    val location: String,
+    val method: String,
+    val pathTemplate: String,
+    val exampleUrl: String,
+    val sources: List<String>,
+    val observedCount: Int,
+    val sampleReferences: List<String>,
+    val valueShape: String,
+    val sensitiveName: Boolean = false,
+)
+
+@Serializable
+data class RequestResponseLookup(
+    val reference: String,
+    val source: String?,
+    val found: Boolean,
+    val request: HttpMessageEvidence?,
+    val response: HttpMessageEvidence?,
+    val note: String,
+)
+
+@Serializable
+data class HttpMessageEvidence(
+    val startLine: String?,
+    val url: String?,
+    val statusCode: Int?,
+    val headers: Map<String, String>,
+    val headerNames: List<String>,
+    val bodyBytes: Int,
+    val bodyPreview: String?,
+    val bodyTruncated: Boolean,
+)
 
 @Serializable
 data class ScannerTaskStatus(
