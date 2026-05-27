@@ -905,6 +905,80 @@ class ToolsKtTest {
         }
 
         @Test
+        fun `start burp audit should return task id when status fields are unsupported`() {
+            val scanner = mockk<Scanner>()
+            val audit = mockk<Audit>()
+            every { api.scanner() } returns scanner
+            every { scanner.startAudit(any()) } returns audit
+            every { HttpRequest.httpRequest(any(), any<String>()) } returns mockk<HttpRequest>()
+            every { audit.addRequest(any()) } just runs
+            every { audit.requestCount() } returns 0
+            every { audit.errorCount() } returns 0
+            every { audit.statusMessage() } throws UnsupportedOperationException("Currently unsupported.")
+            every { audit.insertionPointCount() } throws UnsupportedOperationException("Currently unsupported.")
+            every { audit.issues() } throws UnsupportedOperationException("Currently unsupported.")
+            every { audit.delete() } just runs
+            restartWithProfessionalEdition()
+
+            runBlocking {
+                val result = client.callTool(
+                    "start_burp_audit", mapOf(
+                        "requests" to listOf(
+                            mapOf(
+                                "targetHostname" to "example.com",
+                                "targetPort" to 443,
+                                "usesHttps" to true,
+                                "content" to "GET /search?q=test HTTP/1.1\r\nHost: example.com\r\n\r\n"
+                            )
+                        ),
+                        "auditConfiguration" to "active",
+                        "taskName" to "test-audit"
+                    )
+                )
+                delay(100)
+                val text = result.expectTextContent()
+                assertTrue(text.contains("\"taskType\":\"audit\""), text)
+                assertTrue(text.contains("\"taskName\":\"test-audit\""), text)
+                assertTrue(text.contains("\"statusMessage\":\"status unavailable\""), text)
+                assertTrue(text.contains("statusMessage unavailable: Currently unsupported."), text)
+                assertTrue(text.contains("insertionPointCount unavailable: Currently unsupported."), text)
+                assertTrue(text.contains("issues unavailable: Currently unsupported."), text)
+            }
+
+            verify(exactly = 1) { audit.addRequest(any()) }
+        }
+
+        @Test
+        fun `start burp crawl should return task id when status message is unsupported`() {
+            val scanner = mockk<Scanner>()
+            val crawl = mockk<Crawl>()
+            every { api.scanner() } returns scanner
+            every { scanner.startCrawl(any()) } returns crawl
+            every { crawl.requestCount() } returns 1
+            every { crawl.errorCount() } returns 0
+            every { crawl.statusMessage() } throws UnsupportedOperationException("Currently unsupported.")
+            every { crawl.delete() } just runs
+            restartWithProfessionalEdition()
+
+            runBlocking {
+                val result = client.callTool(
+                    "start_burp_crawl", mapOf(
+                        "seedUrls" to listOf("https://example.com/"),
+                        "taskName" to "test-crawl"
+                    )
+                )
+                delay(100)
+                val text = result.expectTextContent()
+                assertTrue(text.contains("\"taskType\":\"crawl\""), text)
+                assertTrue(text.contains("\"taskName\":\"test-crawl\""), text)
+                assertTrue(text.contains("\"statusMessage\":\"status unavailable\""), text)
+                assertTrue(text.contains("statusMessage unavailable: Currently unsupported."), text)
+            }
+
+            verify(exactly = 1) { scanner.startCrawl(any()) }
+        }
+
+        @Test
         fun `get site map request responses should paginate entries`() {
             val siteMap = mockk<SiteMap>()
             val item1 = mockk<burp.api.montoya.http.message.HttpRequestResponse>()

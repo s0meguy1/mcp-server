@@ -1271,6 +1271,7 @@ data class ScannerTaskStatus(
     val insertionPointCount: Int? = null,
     val issueCount: Int? = null,
     val issues: List<net.portswigger.mcp.schema.IssueDetails>? = null,
+    val statusWarnings: List<String> = emptyList(),
 )
 
 private data class ScannerTaskRecord(
@@ -1316,19 +1317,50 @@ private fun ConcurrentHashMap<String, ScannerTaskRecord>.delete(taskId: String):
 
 private fun ScannerTaskRecord.toStatus(): ScannerTaskStatus {
     val audit = task as? Audit
+    val warnings = mutableListOf<String>()
+    val issues = audit?.let {
+        readScannerTaskField("issues", emptyList(), warnings) {
+            it.issues().map { issue -> issue.toSerializableForm() }
+        }
+    }
     return ScannerTaskStatus(
         taskId = taskId,
         taskName = taskName,
         taskType = taskType,
         createdAt = createdAt,
         seedOrTargetCount = seedsOrTargets.size,
-        requestCount = task.requestCount(),
-        errorCount = task.errorCount(),
-        statusMessage = task.statusMessage(),
-        insertionPointCount = audit?.insertionPointCount(),
-        issueCount = audit?.issues()?.size,
-        issues = audit?.issues()?.map { it.toSerializableForm() },
+        requestCount = readScannerTaskField("requestCount", 0, warnings) { task.requestCount() },
+        errorCount = readScannerTaskField("errorCount", 0, warnings) { task.errorCount() },
+        statusMessage = readScannerTaskField("statusMessage", "status unavailable", warnings) { task.statusMessage() },
+        insertionPointCount = audit?.let {
+            readScannerTaskField<Int?>("insertionPointCount", null, warnings) { it.insertionPointCount() }
+        },
+        issueCount = issues?.size,
+        issues = issues,
+        statusWarnings = warnings,
     )
+}
+
+private fun <T> readScannerTaskField(
+    fieldName: String,
+    fallback: T,
+    warnings: MutableList<String>,
+    block: () -> T,
+): T {
+    return try {
+        block()
+    } catch (exc: UnsupportedOperationException) {
+        warnings.add(scannerTaskStatusWarning(fieldName, exc))
+        fallback
+    } catch (exc: RuntimeException) {
+        warnings.add(scannerTaskStatusWarning(fieldName, exc))
+        fallback
+    }
+}
+
+private fun scannerTaskStatusWarning(fieldName: String, exc: RuntimeException): String {
+    val message = exc.message?.takeIf { it.isNotBlank() } ?: exc.javaClass.simpleName
+    return "$fieldName unavailable: $message"
 }
 
 private data class SeedRequestPreview(
